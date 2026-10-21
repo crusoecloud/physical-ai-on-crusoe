@@ -1,1 +1,26 @@
 * @youngjeong46
+
+# crusoe-osmo — review ownership for the agent-skills tree.
+# The skills drive billable GPU infrastructure and org-scoped storage from two
+# agent harnesses (Claude Code, Hermes); their instruction files are the
+# security boundary (see crusoe-osmo/SECURITY.md). Changes to any of the
+# surfaces below require an owner's review.
+#
+# Security-relevant entry surfaces: every SKILL.md, reference and script.
+# The .skill-hashes manifest must change together with the files it pins.
+/crusoe-osmo/                           @youngjeong46
+
+# Skill instruction files (both harnesses redirect into these)
+/crusoe-osmo/skills/**/SKILL.md         @youngjeong46
+/crusoe-osmo/skills/**/references/**    @youngjeong46
+/crusoe-osmo/skills/**/scripts/**       @youngjeong46
+/crusoe-osmo/skills/**/workflows/**     @youngjeong46
+/crusoe-osmo/skills/**/assets/**        @youngjeong46
+
+# Harness pointer stubs (first instruction a harness reads)
+/crusoe-osmo/.claude/skills/**          @youngjeong46
+/crusoe-osmo/.hermes/skills/**          @youngjeong46
+
+# Integrity manifest (must move with the files it pins)
+/crusoe-osmo/.skill-hashes              @youngjeong46
+/crusoe-osmo/tools/skill_hashes.py      @youngjeong46

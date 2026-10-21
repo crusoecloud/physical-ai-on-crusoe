@@ -1,0 +1,19 @@
+# Eval: opt-in Keycloak login (Phase 10)
+# Verified end-to-end on a 2x H100 cluster.
+name: deploy-keycloak
+description: The opt-in auth path — Keycloak behind its own LB, OIDC enforced at the gateway.
+
+setup:
+  pre: the deploy-cluster scenario's cluster (or any deployment from this skill)
+  ask: the user opts into Keycloak when the plan asks (Phase 1h), or asks for it explicitly
+
+task: |
+  Enable Keycloak login (Phase 10) on my OSMO cluster.
+
+verify:
+  - "A second load balancer exists for Keycloak (keycloak namespace); its certificate is exported"
+  - "Anonymous GET / returns 302 to the Keycloak login page; anonymous GET /api/bucket returns 401"
+  - "A user with roles gets 200 on the API after browser login; a roleless user is denied — 401 (invalid/unmapped token) or 403 (valid JWT, authz denies: no roles), both are passes"
+  - "The backend worker still connects (log: Successfully connected ...) and jobs complete SUCCESS"
+  - "osmo login --method code against the osmo-device client works (the device endpoint ends /auth/device — Keycloak 26's path)"
+  - "CLI/API access tokens still work (exchange at /api/auth/jwt/access_token)"

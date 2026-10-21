@@ -1,0 +1,23 @@
+# Eval: the four-stage Physical-AI chain
+# Verified end-to-end on a 2x H100 + L40s cluster: all stages COMPLETED,
+# train_loss 0.058 -> final 0.020, 72 GB checkpoint on the bucket.
+name: workload-chain
+description: LeRobot prepare -> Cosmos augment -> merge -> GR00T fine-tune, with per-stage gates.
+
+setup:
+  cluster: a deployment from the deploy skill (its workdir with lb_ip and combined-ca-bundle.crt)
+  credentials: osmo CLI logged in; DATA + s3-keys credentials registered; hf-token credential registered
+  licenses: NVIDIA Open Model License accepted on the three gated HF repos
+  scope: defaults (80 episodes, first 5 augmented x 2 variants, 2,000-step smoke fine-tune)
+
+task: |
+  Read and follow skills/run-osmo-workload/SKILL.md. Run the workload on my cluster.
+
+verify:
+  - "Stage 1 (prepare): task COMPLETED; log ends 'v2.1 dataset OK: 80 episodes, 2 cameras' and 'stage-1 artifact done'; >= 6+3*80 objects on the dataset prefix (counted, size-verified)"
+  - "Stage 2a (augment): all aug-* tasks COMPLETED; augmented prefix holds ep_0_aug_0..ep_4_aug_1 + frame-count files; the frame-count spot check passes (generated N == episode N frames at 10fps)"
+  - "Stage 2b (merge): task COMPLETED; log ends 'merged dataset OK: 90 episodes (10 augmented; augmented rows == lengths == video frames)'; training-data prefix (the -data sibling outside the outputs URL) non-empty"
+  - "Stage 3 (fine-tune): master + workers COMPLETED; log ends with a final loss line and 'Data has been uploaded'; 0 UploadWorkerErrors"
+  - "The checkpoint (model*.safetensors + optimizer/scheduler states, ~72 GB) exists under oso-data/checkpoints/<finetune-id>/output/"
+  - "Every stage's counted-transfer assert passed (a COMPLETED badge with a failed gate is a FAIL: the merge once shipped 892 rows against a 297-frame video and COMPLETED anyway)"
+  - "Whole-pipeline wall clock on the order of ~2 h at the defaults"

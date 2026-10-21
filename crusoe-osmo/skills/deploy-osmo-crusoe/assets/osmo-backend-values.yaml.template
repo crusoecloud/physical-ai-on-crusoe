@@ -1,0 +1,44 @@
+# Template — copy verbatim to $WORKDIR/osmo-backend-values.yaml (no placeholders to
+# substitute; the <LB_IP> mention on the Service comment is explanatory). The backend
+# operator install adds no credentials via --set-string.
+global:
+  osmoImageLocation: nvcr.io/nvidia/osmo
+  osmoImageTag: latest
+  imagePullSecret: null
+  # In-cluster Service DNS, NOT <LB_IP>. Same routing rule as above.
+  serviceUrl: https://crusoe.osmo.svc.cluster.local
+  agentNamespace: osmo
+  backendNamespace: default
+  backendTestNamespace: osmo-test
+  backendName: default
+  accountTokenSecret: backend-operator-password
+  accountTokenSecretKey: password
+  loginMethod: token
+  nodeSelector:
+    osmo-type: backend
+
+services:
+  backendListener:
+    imagePullPolicy: IfNotPresent
+    initContainers:
+    - name: wait-for-gateway
+      image: busybox:1.37.0
+      command: ["sh", "-c", "until nc -z crusoe 443; do echo Waiting...; sleep 2; done; echo ready"]
+    resources:
+      requests: { cpu: "125m", memory: "256Mi" }
+      limits: { cpu: "250m", memory: "1Gi" }
+  backendWorker:
+    imagePullPolicy: IfNotPresent
+    initContainers:
+    - name: wait-for-gateway
+      image: busybox:1.37.0
+      command: ["sh", "-c", "until nc -z crusoe 443; do echo Waiting...; sleep 2; done; echo ready"]
+    resources:
+      requests: { cpu: "125m", memory: "256Mi" }
+      limits: { cpu: "250m", memory: "1Gi" }
+
+podMonitor:
+  enabled: false
+
+backendTestRunner:
+  enabled: false

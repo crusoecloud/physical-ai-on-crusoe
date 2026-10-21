@@ -1,0 +1,18 @@
+# Eval: submit_stage.sh (harness-only, 14-check mock-osmo suite green)
+name: submit-script
+description: The workload submit helper (ID-parse, override verification, failure modes).
+
+setup:
+  harness: mock osmo binary (submit/spec/cancel) on PATH; a fixture workdir with combined-ca-bundle.crt
+  env: WORKDIR exported by the caller (the script also re-derives it from CLUSTER/CLUSTER_NAME)
+
+task: |
+  Run scripts/submit_stage.sh through the mock harness: the happy path, each failure
+  mode, and the argument guards.
+
+verify:
+  - "Happy path: the hyphenated workflow ID parses whole (oso_prepare_dataset-3, not '3'); the idfile is written"
+  - "The rendered spec is verified: the storage_url override present, osmo-bucket-placeholder ABSENT; a placeholder spec triggers osmo workflow cancel and the idfile is removed"
+  - "Two --set flags are refused; one --set carries space-separated pairs verbatim; --set-string values reach osmo"
+  - "Submit failure (osmo exit != 0): 'FAILED - nothing was submitted'; ID-parse failure: the do-not-resubmit-blind guidance"
+  - "Missing YAML / missing CA bundle / missing flag values / unknown args all exit 1 with clear one-line messages (no tracebacks)"

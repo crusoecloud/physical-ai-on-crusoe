@@ -1,0 +1,208 @@
+# Template — copy to $WORKDIR/osmo-service-values.yaml and substitute every <…> by hand
+# (no template engine; repeat the per-pool blocks once per GPU pool). No secrets go in the
+# file: the access key is added at install time with --set-string.
+global:
+  osmoImageLocation: nvcr.io/nvidia/osmo
+  osmoImageTag: latest
+  imagePullSecret: null
+  hostname: <LB_IP>
+  nodeSelector:
+    osmo-type: "control"
+
+services:
+  configFile:
+    enabled: true
+  postgres:
+    enabled: true
+    imagePullPolicy: IfNotPresent
+    storageClassName: crusoe-ssd
+    # password: generated in Phase 4b, kept in the osmo-postgres-password Secret and passed with --set-string
+    enableNodePort: false
+    nodeSelector:
+      osmo-type: "control"
+  redis:
+    enabled: true
+    imagePullPolicy: IfNotPresent
+    storageClassName: crusoe-ssd
+    tlsEnabled: false
+    enableNodePort: false
+    nodeSelector:
+      osmo-type: "control"
+  defaultAdmin:
+    enabled: true
+    username: backend-operator
+    passwordSecretName: backend-operator-password
+    passwordSecretKey: password
+  configs:
+    enabled: true
+    service:
+      # In-cluster gateway Service DNS, NOT <LB_IP>. See Phase 7's routing note.
+      service_base_url: https://crusoe.osmo.svc.cluster.local
+    workflow:
+      workflow_data:
+        credential:
+          endpoint: s3://<BUCKET_NAME>/workflows
+          override_url: https://object.<LOCATION>.crusoecloudcompute.com
+          region: <LOCATION>
+          addressing_style: path
+      workflow_log:
+        credential:
+          endpoint: s3://<BUCKET_NAME>/workflows
+          override_url: https://object.<LOCATION>.crusoecloudcompute.com
+          region: <LOCATION>
+          addressing_style: path
+      workflow_app:
+        credential:
+          endpoint: s3://<BUCKET_NAME>/apps
+          override_url: https://object.<LOCATION>.crusoecloudcompute.com
+          region: <LOCATION>
+          addressing_style: path
+      backend_images:
+        init: nvcr.io/nvidia/osmo/init-container:latest
+        client: nvcr.io/nvidia/osmo/client:latest
+      credential_config:
+        disable_data_validation: ["s3"]
+    podTemplates:
+      crusoe_shm:
+        spec:
+          volumes:
+          - name: dshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 32Gi
+          containers:
+          - name: "{{USER_CONTAINER_NAME}}"
+            volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+      # Phase 7 explains this template: osmo-ctrl must trust the self-signed cert.
+      crusoe_ca_trust:
+        spec:
+          volumes:
+          - name: envoy-ca-cert
+            configMap:
+              name: envoy-ca-cert
+          containers:
+          - name: osmo-ctrl
+            env:
+            - name: REQUESTS_CA_BUNDLE
+              value: /etc/osmo/ca/ca.crt
+            - name: SSL_CERT_FILE
+              value: /etc/osmo/ca/ca.crt
+            volumeMounts:
+            - name: envoy-ca-cert
+              mountPath: /etc/osmo/ca
+      # repeat crusoe_<pool_name>_compute for every GPU pool:
+      crusoe_<pool_name>_compute:
+        spec:
+          containers:
+          - name: "{{USER_CONTAINER_NAME}}"
+            env:
+            - name: OSMO_LOGIN_DEV
+              value: "true"
+          - name: osmo-ctrl
+            env:
+            - name: OSMO_LOGIN_DEV
+              value: "true"
+          nodeSelector:
+            crusoe.ai/nodepool.name: <pool_name>
+    pools:
+      default: null
+      # repeat for every GPU pool:
+      <pool_name>:
+        description: "Crusoe <pool_name> Pool"
+        backend: default
+        # Without a default platform every workflow resource needs an explicit `platform:` line.
+        default_platform: default
+        common_pod_template:
+        - default_ctrl
+        - default_user
+        - crusoe_<pool_name>_compute
+        - crusoe_shm
+        - crusoe_ca_trust
+        common_default_variables:
+          USER_CPU: 8
+          USER_GPU: 1
+          USER_MEMORY: "32Gi"
+          USER_STORAGE: "100Gi"
+        platforms:
+          default: {}
+  service:
+    imagePullPolicy: IfNotPresent
+    scaling: { minReplicas: 1, maxReplicas: 1 }
+    extraEnv:
+    - name: AWS_ENDPOINT_URL_S3
+      value: https://object.<LOCATION>.crusoecloudcompute.com
+    - name: AWS_S3_FORCE_PATH_STYLE
+      value: "true"
+    - name: AWS_DEFAULT_REGION
+      value: <LOCATION>
+  worker:
+    imagePullPolicy: IfNotPresent
+    scaling: { minReplicas: 1, maxReplicas: 1 }
+    extraEnv:
+    - name: AWS_ENDPOINT_URL_S3
+      value: https://object.<LOCATION>.crusoecloudcompute.com
+    - name: AWS_S3_FORCE_PATH_STYLE
+      value: "true"
+    - name: AWS_DEFAULT_REGION
+      value: <LOCATION>
+  logger:
+    imagePullPolicy: IfNotPresent
+    scaling: { minReplicas: 1, maxReplicas: 1 }
+    extraEnv:
+    - name: AWS_ENDPOINT_URL_S3
+      value: https://object.<LOCATION>.crusoecloudcompute.com
+    - name: AWS_S3_FORCE_PATH_STYLE
+      value: "true"
+    - name: AWS_DEFAULT_REGION
+      value: <LOCATION>
+  agent:
+    imagePullPolicy: IfNotPresent
+    scaling: { minReplicas: 1, maxReplicas: 1 }
+    extraEnv:
+    - name: AWS_ENDPOINT_URL_S3
+      value: https://object.<LOCATION>.crusoecloudcompute.com
+    - name: AWS_S3_FORCE_PATH_STYLE
+      value: "true"
+    - name: AWS_DEFAULT_REGION
+      value: <LOCATION>
+  delayedJobMonitor:
+    imagePullPolicy: IfNotPresent
+  ui:
+    enabled: true
+    imagePullPolicy: IfNotPresent
+    apiHostname: <LB_IP>:443
+    nextjsSslEnabled: true
+    service:
+      type: ClusterIP
+  router:
+    imagePullPolicy: IfNotPresent
+    scaling: { minReplicas: 1, maxReplicas: 1 }
+
+podMonitor:
+  enabled: false
+
+gateway:
+  name: crusoe
+  envoy:
+    scaling: { minReplicas: 1, maxReplicas: 1 }
+    nodeSelector:
+      osmo-type: "control"
+    ssl:
+      enabled: true
+      secretName: envoy-ssl-cert
+    service:
+      type: LoadBalancer
+      nodePort: null
+      httpsPort: 443
+      annotations:
+        crusoe.ai/manage-firewall-rule: "true"
+    defaultIdentity:
+      user: testuser
+      roles: osmo-admin
+      allowedPools: <comma-separated list of every GPU pool name>
+  oauth2Proxy:
+    enabled: false
+  authz:
+    enabled: false

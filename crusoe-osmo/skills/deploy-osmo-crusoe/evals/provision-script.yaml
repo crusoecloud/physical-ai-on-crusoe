@@ -1,0 +1,21 @@
+# Eval: provision_crusoe.sh flag contract (harness-only, no cluster created)
+# The mock-crusoe harness lives in this scenario's runner; 15 checks, all green.
+name: provision-script
+description: The five Phase-2 create commands, their exact flags and safety gates.
+
+setup:
+  harness: mock crusoe/kubectl binaries on PATH; no real Crusoe account touched
+  env: CLUSTER_NAME LOCATION CLUSTER_VERSION SUBNET_ID SSH_PUBLIC_KEY_PATH POOLS BUCKET_NAME
+
+task: |
+  Run scripts/provision_crusoe.sh against the mock harness for each phase
+  (cluster, pools, bucket, key, creds) and the failure paths.
+
+verify:
+  - "cluster: exact flags (name, location, cluster-version, subnet-id, the three add-ons); an existing cluster name resumes WITHOUT re-creating"
+  - "pools: osmo-control-pool/osmo-backend-pool exact (c1a.8x/c1a.4x, count 1, keyfile, osmo-type=control/backend labels)"
+  - "pools: GPU pools from POOLS spec; --transport-partition-id present only when a partition is given; L40s omits it"
+  - "bucket: create + enable-versioning --yes; enable-locking NEVER invoked"
+  - "key: storage tokens create --alias osmo-workflow-data (the secret prints once)"
+  - "creds: clusters get-credentials <name> --yes then kubectl get nodes"
+  - "A missing SSH key file exits 1 with 'not found' before any create; an unknown phase exits 1 with usage"

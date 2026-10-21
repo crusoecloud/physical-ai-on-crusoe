@@ -1,0 +1,237 @@
+# Stage 3: fine-tune Isaac GR00T N1.5-3B on the merged dataset.
+# Scales with the H100 pool: n_nodes = how many H100 nodes exist (1 node = 8 GPUs).
+# CLI:  osmo workflow submit workflows/03_groot_finetune.yaml --pool h100 \
+#         --set-string storage_url=s3://<bucket>/oso-data \
+#         --set stage2b_id=<stage-2b-workflow-id> n_nodes=<N> [batch_size=<B>]
+# UI:   paste this file, pool h100, fill stage2b_id / storage_url / n_nodes.
+# torchrun is invoked directly with --nnodes=<n_nodes> (the pin's self-invocation
+# hard-codes --nnodes=1); IS_TORCHRUN=1 makes the pin's gr00t_finetune.py run
+# main() per process. torchrun's c10d rendezvous (master_addr = the lead's IP)
+# handles node sync; the group starts all tasks simultaneously.
+workflow:
+  name: oso_groot_finetune
+  pool: {{ pool }}
+  timeout:
+    exec_timeout: 1d
+    queue_timeout: 4h
+  resources:
+    default:
+      cpu: 64          # per node: 8 GPUs + dataloader workers; H100 node has 78
+      gpu: 8           # exactly the node's GPUs (1 task per node)
+      memory: 512Gi
+      storage: 512Gi
+  groups:
+  - name: training
+    tasks:
+    {% for item in range(n_nodes) %}
+    {% if item == 0 %}
+    - name: master
+      lead: true
+      outputs:
+      - url: {{ storage_url }}/{{ output_prefix }}/{{workflow_id}}/
+    {% else %}
+    - name: worker_{{item}}
+    {% endif %}
+      image: pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel
+      command: [bash, /tmp/entry.sh]
+      credentials:
+        hf-token:
+          HF_TOKEN: token
+        # Dataset is self-downloaded from S3 (the sidecar's input download
+        # truncated big trees); these mounted files hold the bucket key.
+        s3-keys: /root/.s3keys
+      environment:
+        ACCEPT_EULA: "Y"
+        IS_TORCHRUN: "1"
+      files:
+      - contents: |
+          set -ex
+          # Security gate: {{ dataset_repo }} reaches shell contexts
+          # (torchrun argv). Fail closed outside [a-zA-Z0-9_/.-] before it renders.
+          # strict allowlist: [a-zA-Z0-9_/.-] only, 3-100 chars —
+          # the exact class security engineering specified. Parens, $, spaces,
+          # backticks, quotes all refuse here BEFORE any use of the value.
+          case "{{ dataset_repo }}" in
+            *[!a-zA-Z0-9_/.-]*) echo "dataset_repo failed allowlist: refused" >&2; exit 1 ;;
+            ???*) ;;   # 3+ chars, all in class: pass
+            *) echo "dataset_repo failed allowlist: refused" >&2; exit 1 ;;
+          esac
+
+          nvidia-smi
+
+          export DEBIAN_FRONTEND=noninteractive
+          apt update && \
+            apt install -y tzdata && \
+            ln -fs /usr/share/zoneinfo/America/Los_Angeles /etc/localtime && \
+            apt install -y netcat dnsutils && \
+            apt-get update && \
+            apt-get install -y libgl1-mesa-glx git libvulkan-dev \
+            zip unzip wget curl git git-lfs build-essential cmake \
+            vim less sudo htop ca-certificates man tmux ffmpeg tensorrt \
+            libglib2.0-0 libsm6 libxext6 libxrender-dev
+
+          git clone https://github.com/NVIDIA/Isaac-GR00T.git && \
+            cd Isaac-GR00T && \
+            git checkout 796ca8d87360913c47e9f75e17c11d63f7805048
+
+          pip install --upgrade setuptools && \
+            pip install gpustat wandb==0.19.0 && \
+            pip install -e .[base] && \
+            pip install jupyterlab==4.0.10
+
+          pip uninstall -y transformer-engine && \
+            pip install flash_attn==2.7.1.post4 -U --force-reinstall && \
+            pip uninstall -y opencv-python opencv-python-headless || true && \
+            rm -rf /usr/local/lib/python3.10/dist-packages/cv2 || true && \
+            pip install opencv-python==4.8.0.74 && \
+            pip install --force-reinstall torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 numpy==1.26.4
+
+          # Exact pin : a >= bound would auto-accept any future
+          # release, including a malicious one, into a root pod with the HF
+          # token and org storage key mounted. 1.15.0 = the version the
+          # recorded end-to-end run resolved (tested-status.md).
+          pip install -e . --no-deps && \
+            pip install accelerate==1.15.0
+
+          export OUTPUT_DIR={{output}}
+          # Workers have no outputs: block, so the output placeholder stays literal
+          # on them (the same  rule as the input placeholder) - a
+          # literal dir would get mkdir'd into the repo CWD; redirect to a local
+          # throwaway instead.
+          # does OUTPUT_DIR contain a literal double-brace sequence? (built
+          # without adjacent braces so the renderer cannot parse it)
+          L1=$(printf '\173'); L2=$(printf '\173')
+          case "$OUTPUT_DIR" in *"$L1$L2"*) OUTPUT_DIR=/tmp/worker-output ;; esac
+          mkdir -p $OUTPUT_DIR
+
+          # Self-download the merged dataset (the sidecar's input download
+          # truncated big trees). boto3 + the mounted s3-keys credential;
+          # leaf-wise listing + heal (Crusoe's list cache goes stale per leaf).
+          pip install --no-cache-dir boto3==1.43.113 >/dev/null
+          python - <<'PY'
+          import os
+          import pathlib
+          import boto3
+
+          def read(name):
+              return pathlib.Path(f"/root/.s3keys/{name}").read_text().strip()
+
+          # Parse the storage_url override (s3://<bucket>/<prefix>) — nothing about
+          # this cluster (bucket, endpoint, tree prefix) is hardcoded.
+          _su = "{{ storage_url }}"
+          assert _su.startswith("s3://"), f"storage_url must be s3://<bucket>/<prefix>: {_su}"
+          _rest = _su[len("s3://"):]
+          BUCKET, _, TREE_ROOT = _rest.partition("/")
+          OVERRIDE = read("override_url")
+          s3 = boto3.client(
+              "s3",
+              endpoint_url=OVERRIDE,
+              aws_access_key_id=read("access_key_id"),
+              aws_secret_access_key=read("access_key"),
+              region_name=OVERRIDE.split("object.")[1].split(".")[0],
+          )
+          # {{ input_prefix }} (default `training`) honors the declared variable —
+          # a hardcoded literal here would silently diverge from the marker prefix.
+          TREE = f"{TREE_ROOT}/{{ input_prefix }}-data/{{ stage2b_id }}/dataset/"  # -data: outside the outputs URL (sidecar mirror-syncs {{output}} over the plain prefix)
+          REPO = TREE + "{{ dataset_repo }}/"
+          dest = pathlib.Path("/data/dataset/{{ dataset_repo }}")
+          LEAVES = {
+              "meta": REPO + "meta/",
+              "data": REPO + "data/chunk-000/",
+              "front": REPO + "videos/chunk-000/observation.images.front/",
+              "wrist": REPO + "videos/chunk-000/observation.images.wrist/",
+          }
+          # Derive the per-leaf expectations from the bucket's own info.json
+          # (hardcoded 80/90 broke --set max_episode/n_aug/dataset overrides).
+          info_bytes = s3.get_object(Bucket=BUCKET, Key=REPO + "meta/info.json")["Body"].read()
+          import json
+          total_eps = json.loads(info_bytes)["total_episodes"]
+          EXPECT = {"meta": 6, "data": total_eps, "front": total_eps, "wrist": total_eps}
+          keys = []
+          for leaf_name, leaf_prefix in LEAVES.items():
+              got = []
+              for attempt in range(4):
+                  got = []
+                  for page in s3.get_paginator("list_objects_v2").paginate(Bucket=BUCKET, Prefix=leaf_prefix):
+                      got.extend((o["Key"], o["Size"]) for o in page.get("Contents", []))
+                  got = [(k, s) for (k, s) in got if not k.rsplit('/', 1)[-1].startswith(".refresh-")]
+                  if len(got) >= EXPECT[leaf_name]:
+                      break
+                  s3.put_object(Bucket=BUCKET, Key=leaf_prefix + f".refresh-{attempt}",
+                                Body=b"list-cache-heal")
+                  print(f"[heal] {leaf_name} list stale ({len(got)}/{EXPECT[leaf_name]}); re-listing")
+              assert len(got) >= EXPECT[leaf_name], (
+                  f"{leaf_name}: only {len(got)}/{EXPECT[leaf_name]} objects after healing")
+              print(f"[leaf] {leaf_name}: {len(got)} objects")
+              keys.extend(got)
+          n = 0
+          bad = []
+          for key, size in keys:
+              rel = key[len(REPO):]
+              if not rel or key.endswith("/"):
+                  continue
+              p = dest / rel
+              p.parent.mkdir(parents=True, exist_ok=True)
+              s3.download_file(BUCKET, key, str(p))
+              n += 1
+              # size check: the versioned-clobber incident shipped a 5-byte video
+              if os.path.getsize(p) != size:
+                  bad.append((rel, os.path.getsize(p), size))
+          assert not bad, f"downloaded sizes differ from bucket: {bad[:5]}"
+          print(f"self-download: {n} files to {dest} (sizes verified); episodes={total_eps}")
+          assert n >= 6 + 3 * total_eps, f"dataset self-download too small ({n} files; want >= 6 meta + 3*{total_eps})"
+          PY
+
+          # Multi-node torchrun: nnodes/node_rank from the template; master =
+          # the group's lead task (the placeholder resolves to the lead's IP).
+
+          # Rendezvous + barrier handled by torchrun's c10d (no extra barrier
+          # script needed; the group starts all tasks simultaneously).
+          # Single-node runs rendezvous on localhost: the pod's own hostname may
+          # fail IPv6 self-resolution inside the pod netns.
+          torchrun --nnodes={{ n_nodes }} --nproc_per_node=8 \
+              --node_rank={{ item }} --master_addr={% if n_nodes == 1 %}127.0.0.1{% else %}{{host:master}}{% endif %} --master_port=29400 \
+              scripts/gr00t_finetune.py \
+              --dataset-path "/data/dataset/{{ dataset_repo }}" \
+              --output-dir $OUTPUT_DIR \
+              --data-config so100_dualcam \
+              --batch-size {{ batch_size }} \
+              --max-steps {{ max_steps }} \
+              --num-gpus 8 \
+              --save-steps {{ save_steps }} \
+              --base-model-path nvidia/GR00T-N1.5-3B \
+              --no-tune-llm \
+              --no-tune-visual \
+              --tune-projector \
+              --tune-diffusion-model \
+              --dataloader-num-workers 12 \
+              --report-to tensorboard \
+              --embodiment-tag new_embodiment \
+              --video-backend decord
+          # The upload worker runs as a different UID; HF writes mode-600
+          # root-owned files ([Errno 13]) — open them up NOW
+          # (after training) or the checkpoint upload can't read them.
+          chmod -R a+rX $OUTPUT_DIR 2>/dev/null || true
+        path: /tmp/entry.sh
+      {% if item == 0 %}
+      checkpoint:
+      - path: "{{output}}"
+        url: {{ storage_url }}/checkpoints/{{workflow_id}}/
+        frequency: 30m
+        regex: .*\.(pt|ckpt|safetensors|json)$
+      {% endif %}
+
+    {% endfor %}
+
+default-values:
+  pool: h100
+  dataset_repo: izuluaga/finish_sandwich
+  storage_url: s3://osmo-bucket-placeholder/oso-data
+  input_prefix: training
+  output_prefix: groot-finetune
+  # stage2b_id has NO default on purpose: OSMO fails submission on an unset variable,
+  # so a submit without --set stage2b_id=<stage-2b run> fails loudly.
+  n_nodes: 1   # H100 nodes in the pool; discover with: kubectl get nodes -l crusoe.ai/nodepool.name=h100 --no-headers | wc -l
+  batch_size: 4           # per-GPU; global batch = 4 x 8 x n_nodes (smoke: 32)
+  max_steps: 2000
+  save_steps: 500

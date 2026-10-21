@@ -1,0 +1,432 @@
+# Stage 2b: merge the augmented episode videos into the converted dataset as new
+# episodes (visual augmentation only: parquet rows copied, timestamps rewritten).
+# CLI:  osmo workflow submit workflows/04_merge_augmented.yaml --pool l40s \
+#         --set-string storage_url=s3://<bucket>/oso-data \
+#         --set stage1_id=<stage-1-workflow-id> stage2a_id=<stage-2a-workflow-id>
+# UI:   paste this file, pool l40s, fill stage1_id / stage2a_id / storage_url.
+# (ships as workflows/04_merge_augmented.yaml; merge-augmented.md documents the semantics)
+workflow:
+  name: oso_merge_augmented
+  pool: {{ pool }}
+  timeout:
+    exec_timeout: 2h
+    queue_timeout: 1h
+  resources:
+    default:
+      cpu: 16
+      gpu: 1
+      memory: 64Gi
+      storage: 200Gi
+  groups:
+  - name: merge
+    tasks:
+    - name: run
+      lead: true
+      image: python:3.10-slim
+      command: [bash, /tmp/entry.sh]
+      # The OSMO sidecar's input download silently truncated the 377-file dataset
+      # tree twice (empty once, 80/377 files once); the task downloads the
+      # dataset itself from S3 instead. These mounted files hold the bucket key.
+      credentials:
+        s3-keys: /root/.s3keys
+      files:
+      - contents: |
+          set -euxo pipefail
+          # Security gate: {{ dataset_repo }} reaches shell contexts.
+          # Fail closed outside [a-zA-Z0-9_/.-] before it renders.
+          # strict allowlist: [a-zA-Z0-9_/.-] only, 3-100 chars —
+          # the exact class security engineering specified. Parens, $, spaces,
+          # backticks, quotes all refuse here BEFORE any use of the value.
+          case "{{ dataset_repo }}" in
+            *[!a-zA-Z0-9_/.-]*) echo "dataset_repo failed allowlist: refused" >&2; exit 1 ;;
+            ???*) ;;   # 3+ chars, all in class: pass
+            *) echo "dataset_repo failed allowlist: refused" >&2; exit 1 ;;
+          esac
+
+          apt-get update -qq && apt-get install -y -qq ffmpeg >/dev/null 2>&1 && rm -rf /var/lib/apt/lists/*
+          pip install --no-cache-dir pyarrow==26.0.0 boto3==1.43.113 >/dev/null
+
+          # The dataset download is done HERE, not via OSMO's input sidecar
+          # (which silently truncated this tree twice — see the comment at the
+          # credentials block). The augmented clips keep using the input mount
+          # (small tree, reliable).
+          python - <<'PY'
+          import os
+          import pathlib
+          import boto3
+
+          def read(name):
+              return pathlib.Path(f"/root/.s3keys/{name}").read_text().strip()
+
+          # Parse the storage_url override (s3://<bucket>/<prefix>) — nothing about
+          # this cluster (bucket, endpoint, tree prefix) is hardcoded.
+          _su = "{{ storage_url }}"
+          assert _su.startswith("s3://"), f"storage_url must be s3://<bucket>/<prefix>: {_su}"
+          _rest = _su[len("s3://"):]
+          BUCKET, _, TREE_ROOT = _rest.partition("/")
+          OVERRIDE = read("override_url")
+          # DEBUG: credential lengths + endpoint only (never values)
+          import os as _os
+          print(f"DEBUG creds: ak_len={len(read('access_key_id'))} sk_len={len(read('access_key'))} url={OVERRIDE}", flush=True)
+          s3 = boto3.client(
+              "s3",
+              endpoint_url=OVERRIDE,
+              aws_access_key_id=read("access_key_id"),
+              aws_secret_access_key=read("access_key"),
+              region_name=OVERRIDE.split("object.")[1].split(".")[0],
+          )
+          # stage 1 self-uploads to <stage1_prefix>-data/<id>/dataset/ (kept outside
+          # its outputs URL so OSMO's output-sidecar mirror-sync cannot delete it).
+          TREE = f"{TREE_ROOT}/{{ stage1_prefix }}-data/{{ stage1_id }}/dataset/"
+          dest = pathlib.Path("/data/dataset")
+          # Crusoe Object Storage serves STALE LIST CACHES PER LEAF PREFIX
+          #. So: enumerate the KNOWN leaf dirs,
+          # list each directly, and heal a too-small listing by writing a
+          # marker INTO that leaf and re-listing.
+          REPO = TREE + "{{ dataset_repo }}/"
+          LEAVES = {
+              "meta": REPO + "meta/",
+              "data": REPO + "data/chunk-000/",
+              "front": REPO + "videos/chunk-000/observation.images.front/",
+              "wrist": REPO + "videos/chunk-000/observation.images.wrist/",
+          }
+          # Derive the per-leaf expectations from the bucket's own info.json
+          # (hardcoded 80 broke --set max_episode/dataset overrides).
+          import json
+          print(f"DEBUG get_object: Bucket={BUCKET} Key={REPO + 'meta/info.json'}", flush=True)
+          info_bytes = s3.get_object(Bucket=BUCKET, Key=REPO + "meta/info.json")["Body"].read()
+          total_eps = json.loads(info_bytes)["total_episodes"]
+          EXPECT = {"meta": 6, "data": total_eps, "front": total_eps, "wrist": total_eps}  # meta: info/modality/stats/episodes/episodes_stats/tasks .json/.jsonl
+          keys = []
+          for leaf_name, leaf_prefix in LEAVES.items():
+              got = []
+              for attempt in range(4):
+                  got = []
+                  for page in s3.get_paginator("list_objects_v2").paginate(Bucket=BUCKET, Prefix=leaf_prefix):
+                      got.extend((o["Key"], o["Size"]) for o in page.get("Contents", []))
+                  got = [(k, s) for (k, s) in got if not k.rsplit('/', 1)[-1].startswith(".refresh-")]
+                  if len(got) >= EXPECT[leaf_name]:
+                      break
+                  s3.put_object(Bucket=BUCKET, Key=leaf_prefix + f".refresh-{attempt}",
+                                Body=b"list-cache-heal")
+                  print(f"[heal] {leaf_name} list stale ({len(got)}/{EXPECT[leaf_name]}); wrote marker, re-listing")
+              assert len(got) >= EXPECT[leaf_name], (
+                  f"{leaf_name}: only {len(got)}/{EXPECT[leaf_name]} objects after healing")
+              print(f"[leaf] {leaf_name}: {len(got)} objects")
+              keys.extend(got)
+          n = 0
+          bad = []
+          for key, size in keys:
+              rel = key[len(TREE):]
+              if not rel or key.endswith("/"):
+                  continue
+              p = dest / rel
+              p.parent.mkdir(parents=True, exist_ok=True)
+              s3.download_file(BUCKET, key, str(p))
+              n += 1
+              if os.path.getsize(p) != size:
+                  bad.append((rel, os.path.getsize(p), size))
+          assert not bad, f"downloaded sizes differ from bucket: {bad[:5]}"
+          print(f"self-download: {n} files to {dest} (sizes verified); episodes={total_eps}")
+          assert n >= 6 + 3 * total_eps, f"dataset self-download too small ({n} files; want >= 6 meta + 3*{total_eps})"
+          PY
+
+          python - <<'PY'
+          import json, pathlib, shutil, subprocess, math
+
+          # The dataset was self-downloaded above; clips came from the input mount.
+          ds = pathlib.Path("/data/dataset") / "{{ dataset_repo }}"
+          aug = pathlib.Path("{{input:0}}")
+          out = pathlib.Path("/tmp/merged") / "{{ dataset_repo }}"
+
+          # Diagnostics: prove both input trees landed before touching anything.
+          ds_files = list(ds.glob("videos/chunk-*/*/episode_*.mp4"))
+          print(f"dataset input tree: {len(ds_files)} episode videos under {ds}")
+          print(f"aug clips: {len(list(aug.rglob('ep_*_aug_*.mp4')))} under {aug}")
+          if not ds_files:
+              raise RuntimeError(
+                  f"dataset input mount is EMPTY ({ds}) — the sidecar download "
+                  "failed silently; see the [run][osmo] download lines above")
+
+          if out.exists(): shutil.rmtree(out)
+          shutil.copytree(ds, out)
+
+          # The N1.5 so100_dualcam config asserts the DECODED video resolution
+          # == 640x480 (info.json's shape); the real recordings are 768x432 —
+          # transcode every ORIGINAL video to 640x480 (30fps preserved).
+          for v in sorted(out.glob("videos/chunk-*/*/episode_*.mp4")):
+              subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                              "-i", str(v), "-vf", "scale=640:480",
+                              "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                              "-pix_fmt", "yuv420p", "-an",
+                              str(v.with_suffix(".tmp.mp4"))], check=True)
+              v.with_suffix(".tmp.mp4").replace(v)
+          print("original videos rescaled to 640x480:",
+                len(list(out.glob("videos/chunk-*/*/episode_*.mp4"))))
+
+          info = json.loads((out / "meta/info.json").read_text())
+          CHUNK = info["chunks_size"]
+          eps = [json.loads(l) for l in (out / "meta/episodes.jsonl").read_text().splitlines() if l]
+          stats = [json.loads(l) for l in (out / "meta/episodes_stats.jsonl").read_text().splitlines() if l]
+          eps_by_idx = {e["episode_index"]: e for e in eps}
+          stats_by_idx = {s["episode_index"]: s for s in stats}
+
+          clips = sorted(aug.rglob("ep_*_aug_*.mp4"))
+          assert clips, "no augmented clips downloaded - check stage 2a output prefix"
+          print(f"merging {len(clips)} augmented clips as new episodes")
+
+          import pyarrow.parquet as pq
+          import pyarrow as pa
+          import subprocess
+
+          def rewrite_parquet(src: pathlib.Path, dst: pathlib.Path, new_index: int,
+                              new_fps: int, src_fps: int, new_length: int):
+              """Decimate episode E's parquet rows to the new fps and rewrite
+              episode_index + timestamps. The state/action rows must land 1:1 on the
+              resampled VIDEO frames: keep every (src_fps/new_fps)-th row (the one at
+              the original frame index the new frame j samples, i.e. j*stride),
+              renumber frame_index 0..new_length-1 and set timestamp = frame_index/10.
+              finish_sandwich's timestamps start at 0 within an episode; asserted."""
+              stride = round(src_fps / new_fps)
+              table = pq.read_table(src)
+              fi = table.column("frame_index").to_pylist()
+              ts0 = table.column("timestamp").to_pylist()[0]
+              assert abs(ts0) < 1e-6, f"episode does not start at 0 (t0={ts0})"
+              keep = [i for i, f in enumerate(fi) if f % stride == 0][:new_length]
+              assert len(keep) == new_length, (
+                  f"source has {len(keep)} rows at stride {stride} < video frames {new_length}")
+              table = table.take(keep)
+              cols = {}
+              for name in table.column_names:
+                  if name == "episode_index" or name.endswith("/episode_index"):
+                      col = pa.array([new_index] * len(keep), type=table.column(name).type)
+                  elif name == "frame_index":
+                      col = pa.array(range(len(keep)),
+                                     type=table.column(name).type)
+                  elif name == "timestamp":
+                      col = pa.array([f / new_fps for f in range(len(keep))],
+                                     type=table.column(name).type)
+                  else:
+                      col = table.column(name)
+                  cols[name] = col
+              pq.write_table(pa.table(cols, schema=table.schema), dst)
+
+          def resample_to_10fps(src: pathlib.Path, dst: pathlib.Path):
+              """Same ffmpeg args as stage 2a's resample step."""
+              subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                              "-i", str(src), "-vf", "scale=640:480,fps=10",
+                              "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                              "-pix_fmt", "yuv420p", "-an", str(dst)], check=True)
+
+          merged = 0
+          for clip in clips:
+              stem = clip.stem                      # ep_<E>_aug_<K>
+              _, e_str, _, k_str = stem.split("_")
+              src_idx = int(e_str)
+              # the resampled frame count stage 2a recorded for this episode
+              frames_file = next(aug.rglob(f"ep_{src_idx}_frames.txt"), None)
+              assert frames_file is not None, f"missing ep_{src_idx}_frames.txt"
+              new_length = int(frames_file.read_text().strip())
+              new_idx = info["total_episodes"]
+              chunk = new_idx // CHUNK
+
+              # 1. parquet decimated to the video's frame count (rows land 1:1 on
+              #    the 10fps frames)
+              src_pq = out / f"data/chunk-{src_idx // CHUNK:03d}/episode_{src_idx:06d}.parquet"
+              dst_dir = out / f"data/chunk-{chunk:03d}"
+              dst_dir.mkdir(parents=True, exist_ok=True)
+              rewrite_parquet(src_pq, dst_dir / f"episode_{new_idx:06d}.parquet",
+                              new_idx, new_fps=10, src_fps=int(info["fps"]),
+                              new_length=new_length)
+
+              # 2. front video = the generated clip resampled (the 2a clip is
+              #    768x432 + 30fps; the loader asserts 640x480)
+              vid_dst = out / f"videos/chunk-{chunk:03d}/observation.images.front"
+              vid_dst.mkdir(parents=True, exist_ok=True)
+              resample_to_10fps(clip, vid_dst / f"episode_{new_idx:06d}.mp4")
+              # 2b. wrist video = source wrist clip resampled to 10fps
+              src_v = out / f"videos/chunk-{src_idx // CHUNK:03d}/observation.images.wrist/episode_{src_idx:06d}.mp4"
+              dst_v = out / f"videos/chunk-{chunk:03d}/observation.images.wrist"
+              dst_v.mkdir(parents=True, exist_ok=True)
+              resample_to_10fps(src_v, dst_v / f"episode_{new_idx:06d}.mp4")
+
+              # 3. episodes.jsonl line: length = the resampled frame count
+              e = dict(eps_by_idx[src_idx])
+              e["episode_index"] = new_idx
+              e["length"] = new_length
+              with (out / "meta/episodes.jsonl").open("a") as f:
+                  f.write(json.dumps(e) + "\n")
+
+              # 4. episodes_stats.jsonl line (state/action stats identical)
+              s = dict(stats_by_idx[src_idx]); s["episode_index"] = new_idx
+              with (out / "meta/episodes_stats.jsonl").open("a") as f:
+                  f.write(json.dumps(s) + "\n")
+
+              # 5. info.json counters (info.json video fps stays 30: GR00T's
+              #    decord backend fetches frames by parquet timestamps, not info fps)
+              info["total_episodes"] = new_idx + 1
+              # 2 videos per episode (front + wrist): info.json counts per video file.
+              info["total_videos"] = info.get("total_videos", 0) + 2
+              info["total_chunks"] = math.ceil(info["total_episodes"] / CHUNK)
+              print(f"merged {stem} -> episode {new_idx} ({new_length} frames @10fps)")
+              merged += 1
+
+          (out / "meta/info.json").write_text(json.dumps(info, indent=2))
+
+          # meta/stats.json: the N1.5 pin's _get_metadata indexes EVERY stat of
+          # the state/action ORIGINAL keys with the modality's index range
+          # (arange(start,end)), so any stat shorter than the feature length
+          # (e.g. 'count': [1], scalar 'count') raises IndexError.
+          # Keep only stats whose list length matches the feature's length.
+          stats_p = out / "meta/stats.json"
+          stats = json.loads(stats_p.read_text())
+          feat_len = {}
+          for col, shp in zip(info["features"], info["features"].values()):
+              feat_len[col] = shp["shape"][0]
+          for mod in list(stats):
+              want = feat_len.get(mod)
+              if want is None:
+                  continue
+              for stat_name in list(stats[mod]):
+                  v = stats[mod][stat_name]
+                  if not isinstance(v, list) or len(v) != want:
+                      del stats[mod][stat_name]
+          stats_p.write_text(json.dumps(stats, indent=2))
+          print("stats.json cleaned (state/action stats now length-exact):",
+                {m: sorted(v) for m, v in stats.items()})
+
+          # final sanity gates
+          eps2 = [json.loads(l) for l in (out / "meta/episodes.jsonl").read_text().splitlines() if l]
+          assert len(eps2) == info["total_episodes"]
+          n_pq = len(list(out.glob("data/chunk-*/episode_*.parquet")))
+          assert n_pq == info["total_episodes"], (n_pq, info["total_episodes"])
+          n_front = len(list(out.glob("videos/chunk-*/observation.images.front/episode_*.mp4")))
+          n_wrist = len(list(out.glob("videos/chunk-*/observation.images.wrist/episode_*.mp4")))
+          assert n_front == n_wrist == info["total_episodes"], (n_front, n_wrist)
+          # Every augmented episode: parquet rows == the episode's frame length
+          # (the row↔video-frame 1:1 contract; a merge shipped 892 rows
+          # against a 297-frame video — caught here, not by training).
+          n_original = info["total_episodes"] - merged
+          for e in eps2:
+              if e["episode_index"] < n_original:   # originals: untouched rows
+                  continue
+              pq_path = (out / f"data/chunk-{e['episode_index'] // CHUNK:03d}/"
+                         f"episode_{e['episode_index']:06d}.parquet")
+              rows = pq.read_table(pq_path).num_rows
+              assert rows == e["length"], (e["episode_index"], rows, e["length"])
+          # Frame-count gate: every augmented episode's FRONT and WRIST videos
+          # must carry exactly `length` frames — parquet rows, episodes.jsonl
+          # `length` and both video tracks must agree 1:1 (a resample that
+          # dropped frames passes every count gate above; only ffprobe sees it).
+          def nframes(p):
+              out_ = subprocess.run(
+                  ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                   "-count_frames", "-show_entries", "stream=nb_read_frames",
+                   "-of", "csv=p=0", str(p)],
+                  capture_output=True, text=True, check=True)
+              return int(out_.stdout.strip())
+          for e in eps2:
+              if e["episode_index"] < n_original:   # originals: stage-1 transcode owns them
+                  continue
+              base = out / f"videos/chunk-{e['episode_index'] // CHUNK:03d}"
+              for cam in ("front", "wrist"):
+                  v = base / f"observation.images.{cam}/episode_{e['episode_index']:06d}.mp4"
+                  nf = nframes(v)
+                  assert nf == e["length"], (cam, e["episode_index"], nf, e["length"])
+          print("merged dataset OK:", info["total_episodes"], "episodes",
+                f"({merged} augmented; augmented rows == lengths == video frames)")
+          PY
+
+          # Self-managed upload (the sidecar truncated stage 1's tree the same
+          # way): boto3 + counted, refuse to fake success.
+          pip install --no-cache-dir boto3==1.43.113 >/dev/null
+          python - <<'PY'
+          import pathlib
+          import boto3
+
+          def read(name):
+              return pathlib.Path(f"/root/.s3keys/{name}").read_text().strip()
+
+          # Parse the storage_url override (s3://<bucket>/<prefix>) — nothing about
+          # this cluster (bucket, endpoint, tree prefix) is hardcoded.
+          _su = "{{ storage_url }}"
+          assert _su.startswith("s3://"), f"storage_url must be s3://<bucket>/<prefix>: {_su}"
+          _rest = _su[len("s3://"):]
+          BUCKET, _, TREE_ROOT = _rest.partition("/")
+          OVERRIDE = read("override_url")
+          s3 = boto3.client(
+              "s3",
+              endpoint_url=OVERRIDE,
+              aws_access_key_id=read("access_key_id"),
+              aws_secret_access_key=read("access_key"),
+              region_name=OVERRIDE.split("object.")[1].split(".")[0],
+          )
+          # {{ output_prefix }} (default `training`) so the boto3 upload and the
+          # sidecar's outputs marker always agree (the declared variable is
+          # honored, not a string-literal that can diverge from it).
+          # Same rule as stage 1: self-upload OUTSIDE the outputs URL (mirror-sync
+          # deletes keys under it). The merge reads it from <input_prefix>-data.
+          PREFIX = f"{TREE_ROOT}/{{ output_prefix }}-data/{{workflow_id}}/dataset/"
+          # The tree to upload: the merge heredoc wrote it under /tmp/merged/<repo>.
+          # Upload from the PARENT (/tmp/merged) so the keys carry the <repo>/
+          # segment - matching stage 3's read path (TREE + <repo>/) and the
+          # post-upload head (PREFIX + <repo>/meta/info.json). (The round-1 fix
+          # pointed src at /tmp/merged/<repo>, which dropped the segment and broke
+          # the post-upload head.)
+          src = pathlib.Path("/tmp/merged")
+          assert (src / "{{ dataset_repo }}").is_dir(), f"merged dataset tree missing: {src}"
+          # Derive the upload gate from the tree being uploaded: episodes = parquet count.
+          n_expected = 6 + 3 * len(list(src.glob("data/chunk-*/episode_*.parquet")))
+          n = 0
+          for p in sorted(src.rglob("*")):
+              if not p.is_file():
+                  continue
+              key = PREFIX + str(p.relative_to(src))
+              s3.upload_file(str(p), BUCKET, key)
+              n += 1
+          print(f"self-upload: {n} objects to {BUCKET}/{PREFIX} (expected >= {n_expected})")
+          assert n >= n_expected, (
+              f"merge upload too small ({n} objects; want >= {n_expected}: meta + 3*episodes)")
+          # The post-upload head can 404 on a freshly written versioned prefix
+          # (listing/visibility lag: the upload itself succeeded
+          # and the immediate head 404'd). Retry with backoff before failing.
+          import time as _time
+          head = None
+          for _attempt in range(4):
+              try:
+                  head = s3.head_object(Bucket=BUCKET, Key=PREFIX + "{{ dataset_repo }}/meta/info.json")
+                  break
+              except s3.exceptions.ClientError:
+                  # (unbound-after-block: don't bind the exception to a name)
+                  import sys as _sys
+                  if "404" not in str(_sys.exc_info()[1]) or _attempt == 3:
+                      raise
+                  print(f"info.json head 404 (attempt {_attempt + 1}/4) - visibility lag; retrying in 10s", flush=True)
+                  _time.sleep(10)
+          print("info.json size on bucket:", head["ContentLength"])
+          PY
+
+          # Non-empty output marker so the sidecar's own upload step succeeds.
+          mkdir -p {{output}}/dataset
+          echo "merged dataset lives at {{ storage_url }}/{{ output_prefix }}/{{workflow_id}}/dataset/ (self-uploaded)" > {{output}}/dataset/LOCATION.txt
+          echo "stage-2b artifact done"
+        path: /tmp/entry.sh
+      inputs:
+      # Only the augmented clips ride the input mount (small tree, reliable).
+      # The dataset is downloaded in-task from S3 (the sidecar truncated this
+      # tree twice — see the credentials comment).
+      - url: {{ storage_url }}/{{ stage2a_prefix }}/{{ stage2a_id }}/
+      outputs:
+      - url: {{ storage_url }}/{{ output_prefix }}/{{workflow_id}}/
+
+default-values:
+  pool: l40s
+  dataset_repo: izuluaga/finish_sandwich
+  storage_url: s3://osmo-bucket-placeholder/oso-data
+  stage1_prefix: dataset
+  stage2a_prefix: augmented
+  # stage1_id / stage2a_id have NO defaults on purpose: OSMO fails submission on an
+  # unset variable, so a submit without --set stage1_id=<stage-1 run>
+  # stage2a_id=<stage-2a run> (ONE --set, space-separated pairs) fails loudly
+  # instead of reading an empty prefix.
+  output_prefix: training
