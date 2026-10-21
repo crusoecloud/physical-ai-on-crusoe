@@ -22,3 +22,7 @@ Each solution README will also list its own specific prerequisites.
 ### [NVIDIA OSMO on Crusoe](./crusoe-osmo)
 
 Use the two agent skills (SKILL.md format) with your agent harness to provision Crusoe Managed Kubernetes, deploy NVIDIA OSMO on Crusoe, and (optionally) run a sample Physical AI Pipeline.
+
+## License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
