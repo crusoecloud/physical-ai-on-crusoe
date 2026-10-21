@@ -1,1 +1,25 @@
-* @youngjeong46
+# CODEOWNERS — review ownership for the agent-skills repo.
+# The skills drive billable GPU infrastructure and org-scoped storage from two
+# agent harnesses (Claude Code, Hermes); their instruction files are the
+# security boundary (see SECURITY.md). Changes to any of the surfaces below
+# require an owner's review — GitLab serves this file from the default branch.
+#
+# Security-relevant entry surfaces: every SKILL.md, reference and script.
+# The .skill-hashes manifest must change together with the files it pins.
+* @yjeong1
+* @Yenchiho
+
+# Skill instruction files (both harnesses redirect into these)
+skills/**/SKILL.md          @yjeong1
+skills/**/references/**     @yjeong1
+skills/**/scripts/**        @yjeong1
+skills/**/workflows/**      @yjeong1
+skills/**/assets/**         @yjeong1
+
+# Harness pointer stubs (first instruction a harness reads)
+.claude/skills/**           @yjeong1
+.hermes/skills/**           @yjeong1
+
+# Integrity manifest (must move with the files it pins)
+.skill-hashes               @yjeong1
+tools/skill_hashes.py       @yjeong1

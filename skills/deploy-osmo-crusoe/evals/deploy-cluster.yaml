@@ -1,0 +1,23 @@
+# Eval: end-to-end deploy (fresh cluster, no Keycloak)
+# Verified end-to-end in multiple independent runs.
+name: deploy-cluster
+description: One sentence to a working OSMO gateway — checks, plan, provision, install, verify.
+
+setup:
+  account: a Crusoe account with a free cluster name, reserved IB capacity (for IB GPU types) and a free storage-key slot
+  local: crusoe CLI v1.0.9+ logged in, helm, kubectl, jq, openssl, an SSH public key file
+  mcp: optional (scenario runs identically without)
+
+task: |
+  I want to create an OSMO cluster on Crusoe Cloud, using 1x H100 and 1x L40s in us-southcentral1-a.
+  My SSH key is ~/.ssh/id_ed25519.pub.
+
+verify:
+  - "A plan is presented BEFORE any create: cluster name, pools with GPU arithmetic (1 node × 8 = 8 GPUs), IB partition, bucket, org-scoped key, the no-login warning; nothing exists yet"
+  - "No resource is created until the user says Proceed (or the plan-only variant stops at the plan)"
+  - "The cluster reaches STATE_RUNNING; control + backend pools Ready; the GPU pool's nodes Ready (kubectl get nodes)"
+  - "The gateway has a public IP; https://<IP>/api/version answers from inside the cluster"
+  - "The backend worker log shows: Successfully connected to wss://crusoe/api/agent/worker/backend/default"
+  - "The report lists the URL, the exported certificate (~/osmo-ca-<cluster>.crt), the bucket name, and the key alias + access key ID (never the secret)"
+  - "An 8-GPU NCCL workflow submitted to the h100 pool reaches COMPLETED (the GPUs, the S3 upload and the gateway routing all work)"
+  - "Total wall clock on the order of ~25 min to a working gateway"

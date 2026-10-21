@@ -1,0 +1,304 @@
+# Stage 2a: Cosmos-Predict2-2B-Video2World visual augmentation on a subset of episodes.
+# CLI:  osmo workflow submit workflows/02_cosmos_augment.yaml --pool l40s \
+#         --set-string storage_url=s3://<bucket>/oso-data
+# UI:   paste this file, pool l40s.
+# Produces: s3://<bucket>/oso-data/augmented/<workflow_id>/ep_<E>_aug_<K>.mp4
+workflow:
+  name: oso_cosmos_augment
+  pool: {{ pool }}
+  timeout:
+    exec_timeout: 12h
+    queue_timeout: 4h
+  resources:
+    default:
+      cpu: 8
+      gpu: 1
+      memory: 64Gi
+      # Gang scheduling (KAI) must fit ALL concurrent tasks on one node at once;
+      # the node's allocatable disk is ~447 GB and each task also pulls
+      # T5-11b/Reason1/guardrail checkpoints (~75 GB) + a ~20 GB container image
+      # (deduped). default n_tasks=2: 2 × 128Gi = 256 GB ≤ 447 GB.
+      storage: 128Gi
+  groups:
+  - name: augment
+    tasks:
+    {% for t in range(n_tasks) %}
+    - name: "aug-{{ t }}"
+      {% if t == 0 %}lead: true{% endif %}
+      image: nvcr.io/nvidia/cosmos/cosmos-predict2-container:1.2
+      command: [bash, /tmp/entry.sh]
+      credentials:
+        hf-token:
+          HF_TOKEN: token
+        # REGISTRY credential -> imagePullSecret for the nvcr.io pull (the Cosmos
+        # container is gated behind NGC auth; anonymous pulls get insufficient_scope).
+        nvcr: {}
+      environment:
+        ACCEPT_EULA: "Y"
+      files:
+      - contents: |
+          set -euxo pipefail
+          # Security gate: {{ dataset_repo }} reaches shell contexts
+          # below. Fail closed outside [a-zA-Z0-9_/.-] before it renders.
+          # strict allowlist: [a-zA-Z0-9_/.-] only, 3-100 chars —
+          # the exact class security engineering specified. Parens, $, spaces,
+          # backticks, quotes all refuse here BEFORE any use of the value.
+          case "{{ dataset_repo }}" in
+            *[!a-zA-Z0-9_/.-]*) echo "dataset_repo failed allowlist: refused" >&2; exit 1 ;;
+            ???*) ;;   # 3+ chars, all in class: pass
+            *) echo "dataset_repo failed allowlist: refused" >&2; exit 1 ;;
+          esac
+
+          N_TASKS={{ n_tasks }}             # stride: this task takes every N_TASKS-th episode
+          N_AUG={{ n_aug }}                 # variants per episode (default 2)
+          MAX_EP=$(( {{ max_episode }} ))   # only episodes < MAX_EP are augmented (default 5)
+
+          # Dataset dir as downloaded from the stage-1 output prefix.
+          DS="{{input:0}}/dataset/{{ dataset_repo }}"
+
+          # Build this task's episode list FIRST (the verification below checks
+          # exactly these episodes): every N_TASKS-th episode below MAX_EP.
+          # With n_tasks=2/max_episode=5: aug-0 → 0,2,4; aug-1 → 1,3.
+          EPISODES=$(for ((e = {{ t }}; e < MAX_EP; e += N_TASKS)); do echo "$e"; done)
+          [ -n "$EPISODES" ] || { echo "no episodes for this task" > {{output}}/.skipped; echo "task done (skipped)"; exit 0; }
+          echo "episodes for aug-{{ t }}: $EPISODES"
+
+          mkdir -p {{output}}
+          touch {{output}}/.skipped   # non-empty upload even if all episodes fail mid-way
+
+          # Verify the input mount BEFORE the expensive steps (the sidecar's
+          # download of this 246-object tree is known to truncate - Tested
+          # status rule 1). Fail here, not after the 20 GB image + ~75 GB of
+          # checkpoints: every meta file + this task's front videos must be
+          # present.
+          for f in "$DS/meta/episodes.jsonl" "$DS/meta/tasks.jsonl" "$DS/meta/info.json"; do
+            [ -f "$f" ] || { echo "sidecar input truncation: missing $f (re-run stage 2a; do not proceed)"; exit 1; }
+          done
+          for EP in $EPISODES; do
+            SRC="$DS/videos/chunk-000/observation.images.front/episode_$(printf '%06d' "$EP").mp4"
+            [ -s "$SRC" ] || { echo "sidecar input truncation: missing/empty $SRC (re-run stage 2a; do not proceed)"; exit 1; }
+          done
+          echo "input mount verified for episodes: $EPISODES"
+
+          cd /workspace
+          if [ ! -d cosmos-predict2 ]; then
+            git clone https://github.com/nvidia-cosmos/cosmos-predict2.git
+          fi
+          cd cosmos-predict2
+          git checkout 661da4774b0ca41d082a0ecbeb47550bcf07e03f
+          if [ ! -d .venv ]; then
+            # PINNED + hash-verified uv binary, not curl|sh of the mutable
+            # astral.sh installer : this pod runs as root with
+            # credentials mounted; no unreviewed code executes here.
+            UV_V=0.13.2
+            UV_SHA=e14d48c117ec33601d6f860dda47aa5ea490d77a5a9ef770529c448fa6747d9f
+            curl -fsSL -o /tmp/uv.tgz "https://github.com/astral-sh/uv/releases/download/${UV_V}/uv-x86_64-unknown-linux-gnu.tar.gz"
+            echo "${UV_SHA}  /tmp/uv.tgz" | sha256sum -c - || exit 1
+            tar -xzf /tmp/uv.tgz -C /usr/local/bin --strip-components=1 uv-x86_64-unknown-linux-gnu/uv
+            rm /tmp/uv.tgz
+            uv sync --extra cu126
+          fi
+          source .venv/bin/activate
+
+          # Checkpoints: only the 480p/10fps video2world DiT + its tokenizer.
+          # COSMOS_PREDICT2_ARGS points the library at the download dir and pins the
+          # T5 text encoder (the default; also what the container supports).
+          export COSMOS_PREDICT2_ARGS="--checkpoints $PWD/checkpoints --text_encoder t5"
+          python scripts/download_checkpoints.py \
+            --model_types video2world --model_sizes 2B \
+            --fps 10 --resolution 480 \
+            --checkpoint_dir "$PWD/checkpoints"
+          # (downloads model-480p-10fps.pt + tokenizer/* for
+          #  nvidia/Cosmos-Predict2-2B-Video2World, pinned to the recorded revision;
+          #  requires HF_TOKEN with the NVIDIA Open Model License accepted.
+          #  Note: the script also unconditionally downloads Cosmos-Reason1-7B, T5-11b
+          #  and the guardrail models (~15 GB extra). Acceptable; do not "optimize"
+          #  the script - the pipeline reads guardrail/Reason1 paths unconditionally.)
+
+          ffmpeg -hide_banner -loglevel error -y -version | head -1 || true
+          apt-get update -qq && apt-get install -y -qq ffmpeg >/dev/null 2>&1 || true
+
+          for EP in $EPISODES; do
+
+            SRC="$DS/videos/chunk-000/observation.images.front/episode_$(printf '%06d' "$EP").mp4"
+            [ -f "$SRC" ] || { echo "missing $SRC"; exit 1; }
+
+            # Prompt: this episode's first task description from the v2.1 metadata.
+            # v3 episodes.jsonl carries `tasks` as DESCRIPTION STRINGS (verified
+            # from finish_sandwich's episode metadata); after conversion the
+            # episode's task_index is what tasks.jsonl keys on. Prefer the string.
+            PROMPT=$(python - <<PYEOF
+          import json
+          eps = [json.loads(l) for l in open("$DS/meta/episodes.jsonl")]
+          ep = next(e for e in eps if e["episode_index"] == $EP)
+          t = ep["tasks"][0]
+          if isinstance(t, str):
+              desc = t
+          else:
+              tasks = [json.loads(l) for l in open("$DS/meta/tasks.jsonl")]
+              desc = next(x["task"] for x in tasks if x["task_index"] == t)
+          print(desc.replace('"', "'"))
+          PYEOF
+          )
+            echo "episode $EP prompt: $PROMPT"
+
+            # Resample 30fps -> 10fps, scale to 480p-height class, h264 yuv420p.
+            # Predict2 480p/16:9 generates 832x480; conditioning input is
+            # resized/center-cropped by the pipeline itself, so just match height.
+            # NOTE: 30->10 fps means the resampled clip has ~1/3 the source frame
+            # count. The generated video therefore matches the RESAMPLED count, and
+            # stage 2b decimates the new episode's parquet to the resampled frame
+            # count (row j = source frame 3j, timestamps regenerated; the kept
+            # state/action values are the source's own, in real time).
+            RESAMPLED=/tmp/ep_${EP}_10fps.mp4
+            ffmpeg -hide_banner -loglevel error -y -i "$SRC" \
+              -vf "scale=-2:480,fps=10" \
+              -c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p "$RESAMPLED"
+
+            FRAMES=$(ffprobe -v error -select_streams v:0 -count_frames \
+              -show_entries stream=nb_read_frames -of csv=p=0 "$RESAMPLED")
+            echo "episode $EP: $FRAMES frames at 10fps"
+            echo "$FRAMES" > {{output}}/ep_${EP}_frames.txt
+
+            for K in $(seq 0 $((N_AUG - 1))); do
+              OUT={{output}}/ep_${EP}_aug_${K}.mp4
+              SEED=$(( 1000 * EP + K ))
+              # augment_one.py chunk-walks the episode (61-frame chunks @10fps,
+              # 5-frame conditioning between chunks) and emits exactly $FRAMES
+              # frames @ 10fps (its log line "aligned to <N> frames" is the check):
+              python /tmp/augment_one.py \
+                --input "$RESAMPLED" --output "$OUT" \
+                --prompt "$PROMPT" --seed "$SEED"
+              [ -s "$OUT" ] || { echo "augmentation failed for ep $EP variant $K"; exit 1; }
+            done
+          done
+          echo "aug task done: $(ls -la {{output}})"
+        path: /tmp/entry.sh
+      - contents: |
+          """Generate one augmented video with Cosmos-Predict2-2B-Video2World.
+
+          In-process variant of examples/video2world_lvg.py with the 480p/10fps
+          pipeline config (lvg's setup_pipeline hard-codes 720p/16fps). Chunks:
+          chunk 0 conditions on the last 5 frames of the resampled episode and
+          generates a 61-frame block ((state_t=16 - 1) * 4 + 1); every later chunk
+          conditions on the last 5 frames of the previous chunk; generated blocks
+          (minus the re-used conditioning frames) are concatenated and the final
+          video is trimmed/padded to the source episode's exact frame count.
+          """
+          import argparse, math, os, subprocess
+          import torch
+
+          CHUNK = 61   # get_pixel_num_frames(state_t=16) at 480p/10fps
+          COND = 5     # multi-frame conditioning
+
+          def main():
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--input", required=True)
+              ap.add_argument("--output", required=True)
+              ap.add_argument("--prompt", required=True)
+              ap.add_argument("--seed", type=int, default=0)
+              args = ap.parse_args()
+
+              os.chdir("/workspace/cosmos-predict2")
+              from imaginaire.utils.io import save_image_or_video
+              from cosmos_predict2.configs.base.config_video2world import (
+                  get_cosmos_predict2_video2world_pipeline,
+              )
+              from cosmos_predict2.pipelines.video2world import Video2WorldPipeline
+
+              probe = subprocess.run(
+                  ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_frames",
+                   "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", args.input],
+                  capture_output=True, text=True, check=True)
+              source_frames = int(probe.stdout.strip())
+              # chunks needed to cover (source_frames - COND) generated frames,
+              # each chunk after the first contributing (CHUNK - COND) new frames
+              gen_needed = max(source_frames - COND, 1)
+              chunks = max(1, math.ceil(gen_needed / (CHUNK - COND)))
+              print(f"source frames {source_frames} -> {chunks} chunk(s)")
+
+              config = get_cosmos_predict2_video2world_pipeline(
+                  model_size="2B", resolution="480", fps=10)
+              config.prompt_refiner_config.enabled = False
+              config.guardrail_config.enabled = False
+              pipe = Video2WorldPipeline.from_config(
+                  config=config,
+                  # The library does not resolve an empty dit_path crashed). Pass the
+                  # downloaded checkpoint explicitly.
+                  dit_path="checkpoints/nvidia/Cosmos-Predict2-2B-Video2World/model-480p-10fps.pt",
+                  use_text_encoder=True,
+                  # offload_text_encoder=True is BROKEN in this repo version. Keep the encoder resident on the
+                  # GPU and downcast it to bf16 (precision) — ~22 GB on an L40S's
+                  # 48 GB, alongside the ~5 GB DiT + tokenizer.
+                  offload_text_encoder=False,
+                  downcast_text_encoder=True,
+                  device="cuda",
+                  torch_dtype=torch.bfloat16,
+                  load_ema_to_reg=False,
+                  load_prompt_refiner=False,
+              )
+
+              pieces = []
+              current_input = args.input
+              for c in range(chunks):
+                  video, _ = pipe(
+                      prompt=args.prompt,
+                      input_path=current_input,
+                      num_conditional_frames=COND,
+                      seed=args.seed + c,
+                      return_prompt=True,
+                  )
+                  if video is None:
+                      raise RuntimeError(f"pipeline returned None at chunk {c}")
+                  # chunks after the first: drop the re-used conditioning frames
+                  piece = video if c == 0 else video[:, :, COND:, :, :]
+                  pieces.append(piece.cpu())
+                  if c < chunks - 1:
+                      tail = video[:, :, -COND:, :, :].cpu()
+                      tail_path = f"/tmp/lvg_cond_{args.seed}_{c}.mp4"
+                      os.makedirs("/tmp", exist_ok=True)
+                      save_image_or_video(tail, tail_path, fps=10)
+                      current_input = tail_path
+                  print(f"chunk {c + 1}/{chunks} done")
+
+              full = torch.cat(pieces, dim=2)  # (B, C, T, H, W)
+              os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+              save_image_or_video(full, args.output, fps=10)
+              # Exact-count correction pass (trim to the source frame count; the
+              # concat overshoots by construction - trim never pads here because
+              # chunks was sized to cover, and a tiny overshoot is trimmed).
+              tmp = args.output + ".tmp.mp4"
+              subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                              "-i", args.output,
+                              "-frames:v", str(source_frames),
+                              "-c:v", "libx264", "-preset", "veryfast",
+                              "-crf", "18", "-pix_fmt", "yuv420p", tmp], check=True)
+              subprocess.run(["mv", tmp, args.output], check=True)
+              print("generated", args.output, "aligned to", source_frames, "frames")
+
+          if __name__ == "__main__":
+              main()
+        path: /tmp/augment_one.py
+      inputs:
+      # stage 1 self-uploads to <input_prefix>-data/<id>/dataset/ (outside its outputs
+      # URL - the output sidecar mirror-syncs {{output}} over the plain prefix).
+      - url: {{ storage_url }}/{{ input_prefix }}-data/{{ stage1_id }}/
+      outputs:
+      - url: {{ storage_url }}/{{ output_prefix }}/{{workflow_id}}/
+    {% endfor %}
+
+default-values:
+  pool: l40s
+  dataset_repo: izuluaga/finish_sandwich
+  storage_url: s3://osmo-bucket-placeholder/oso-data   # override with --set-string storage_url=s3://<bucket>/oso-data
+  input_prefix: dataset
+  output_prefix: augmented
+  n_aug: 2
+  max_episode: 5
+  # n_tasks × storage must fit the node: gang scheduling needs ALL tasks schedulable
+  # at once, and each task also holds ~75 GB of checkpoints + a ~20 GB image.
+  n_tasks: 2
+  # stage1_id has NO default on purpose: OSMO fails submission on an unset variable,
+  # so a submit without --set stage1_id=<stage-1 workflow id> fails loudly instead of
+  # downloading every stage-1 run's output (a run downloaded 12.6 MB of the
+  # wrong tree and died on the missing episodes because this id was missing).

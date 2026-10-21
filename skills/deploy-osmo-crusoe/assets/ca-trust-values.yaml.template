@@ -1,0 +1,93 @@
+# Template — copy verbatim to $WORKDIR/ca-trust-values.yaml (no placeholders).
+# Keep BOTH initContainers (wait-for-gateway AND install-ca-cert): Helm replaces list
+# values across -f files — dropping wait-for-gateway makes the gateway-wait vanish.
+services:
+  backendListener:
+    initContainers:
+    - name: wait-for-gateway
+      image: busybox:1.37.0
+      command: ["sh", "-c", "until nc -z crusoe 443; do echo Waiting...; sleep 2; done; echo ready"]
+    - name: install-ca-cert
+      image: curlimages/curl:8.10.1
+      command:
+      - sh
+      - -c
+      - |
+        set -e
+        TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+        NS=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)
+        # Verify the API server against the cluster CA that Kubernetes mounts in every pod.
+        curl -fsS --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
+          -H "Authorization: Bearer $TOKEN" -o /tmp/cm.json \
+          "https://kubernetes.default.svc/api/v1/namespaces/$NS/configmaps/envoy-ca-cert"
+        awk '
+        BEGIN { RS="\"ca.crt\":[ ]*\""; }
+        NR==2 {
+          s = $0; out = ""; i = 1; n = length(s)
+          while (i <= n) {
+            c = substr(s, i, 1)
+            if (c == "\\" && i < n) {
+              nc = substr(s, i+1, 1)
+              if (nc == "n") { out = out "\n" }
+              else if (nc == "\"") { out = out "\"" }
+              else if (nc == "\\") { out = out "\\" }
+              else { out = out nc }
+              i += 2
+            } else if (c == "\"") { break }
+            else { out = out c; i++ }
+          }
+          printf "%s", out
+        }' /tmp/cm.json > /var/run/osmo/ca.crt
+        test -s /var/run/osmo/ca.crt
+      volumeMounts:
+      - name: progress-files
+        mountPath: /var/run/osmo
+    extraEnvs:
+    - name: REQUESTS_CA_BUNDLE
+      value: /var/run/osmo/ca.crt
+    - name: SSL_CERT_FILE
+      value: /var/run/osmo/ca.crt
+  backendWorker:
+    initContainers:
+    - name: wait-for-gateway
+      image: busybox:1.37.0
+      command: ["sh", "-c", "until nc -z crusoe 443; do echo Waiting...; sleep 2; done; echo ready"]
+    - name: install-ca-cert
+      image: curlimages/curl:8.10.1
+      command:
+      - sh
+      - -c
+      - |
+        set -e
+        TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+        NS=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)
+        curl -fsS --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
+          -H "Authorization: Bearer $TOKEN" -o /tmp/cm.json \
+          "https://kubernetes.default.svc/api/v1/namespaces/$NS/configmaps/envoy-ca-cert"
+        awk '
+        BEGIN { RS="\"ca.crt\":[ ]*\""; }
+        NR==2 {
+          s = $0; out = ""; i = 1; n = length(s)
+          while (i <= n) {
+            c = substr(s, i, 1)
+            if (c == "\\" && i < n) {
+              nc = substr(s, i+1, 1)
+              if (nc == "n") { out = out "\n" }
+              else if (nc == "\"") { out = out "\"" }
+              else if (nc == "\\") { out = out "\\" }
+              else { out = out nc }
+              i += 2
+            } else if (c == "\"") { break }
+            else { out = out c; i++ }
+          }
+          printf "%s", out
+        }' /tmp/cm.json > /var/run/osmo/ca.crt
+        test -s /var/run/osmo/ca.crt
+      volumeMounts:
+      - name: progress-files
+        mountPath: /var/run/osmo
+    extraEnvs:
+    - name: REQUESTS_CA_BUNDLE
+      value: /var/run/osmo/ca.crt
+    - name: SSL_CERT_FILE
+      value: /var/run/osmo/ca.crt

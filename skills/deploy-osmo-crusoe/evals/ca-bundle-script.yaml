@@ -1,0 +1,17 @@
+# Eval: build_ca_bundle.sh gates (harness-only)
+# The mock-kubectl harness; 12 checks, all green.
+name: ca-bundle-script
+description: The Phase-7 CA build (fetch gate, concat, three-namespace fan-out, restarts).
+
+setup:
+  harness: mock kubectl (logs -> 120 certs; get secret -> a fake cert; get deploy -> the two backend deployments)
+  env: CLUSTER_NAME set; HOME redirected to a temp home
+
+task: |
+  Run scripts/build_ca_bundle.sh against the mock harness, happy path and both failure gates.
+
+verify:
+  - "The public bundle is fetched from the in-cluster image and gated at >=100 BEGIN CERTIFICATE lines; an empty bundle exits 1"
+  - "combined-ca-bundle.crt = public bundle + envoy cert (both present in the output file)"
+  - "The envoy-ca-cert ConfigMap is created in osmo, default AND osmo-test (workflow pods do not run in osmo)"
+  - "Both backend deployments are rollout-restarted and status-gated; a wrong deployment count exits 1"

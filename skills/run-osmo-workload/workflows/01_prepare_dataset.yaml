@@ -1,0 +1,208 @@
+# Stage 1: prepare a GR00T-ready (LeRobot v2.1 + modality.json) dataset from
+# izuluaga/finish_sandwich (LeRobot v3.0).
+# CLI:  osmo workflow submit workflows/01_prepare_dataset.yaml --pool l40s
+#       (add --set-string storage_url=s3://<bucket>/oso-data to override the default)
+# UI:   paste this file, set the pool to l40s on the submit screen.
+workflow:
+  name: oso_prepare_dataset
+  pool: {{ pool }}
+  timeout:
+    exec_timeout: 6h
+    queue_timeout: 1h
+  resources:
+    default:
+      cpu: 16
+      gpu: 1
+      memory: 64Gi
+      storage: 200Gi
+  groups:
+  - name: prepare
+    tasks:
+    - name: run
+      lead: true
+      image: python:3.10-slim
+      command: [bash, /tmp/entry.sh]
+      # Mounted files hold the bucket key (same credential the merge task uses).
+      credentials:
+        s3-keys: /root/.s3keys
+      files:
+      - contents: |
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update && apt-get install -y --no-install-recommends \
+            git git-lfs ffmpeg ca-certificates curl unzip \
+            build-essential python3-dev linux-libc-dev
+          rm -rf /var/lib/apt/lists/*
+
+          # uv env for the official v3->v2.1 converter (its own subproject env,
+          # NOT installed from the repo root - that would pull in the gr00t package).
+          # PINNED + hash-verified binary, not curl|sh of a mutable installer
+          # script : the pod runs as root with the org storage key
+          # mounted; a supply-chain hit on astral.sh must not yield a shell here.
+          UV_V=0.13.2
+          UV_SHA=e14d48c117ec33601d6f860dda47aa5ea490d77a5a9ef770529c448fa6747d9f
+          curl -fsSL -o /tmp/uv.tgz "https://github.com/astral-sh/uv/releases/download/${UV_V}/uv-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${UV_SHA}  /tmp/uv.tgz" | sha256sum -c - || exit 1
+          tar -xzf /tmp/uv.tgz -C /usr/local/bin --strip-components=1 uv-x86_64-unknown-linux-gnu/uv
+          rm /tmp/uv.tgz
+
+          # PINNED: NVIDIA reorganizes this repo without notice (the so100 dualcam
+          # modality file moved from getting_started/examples to examples/SO100
+          # between two consecutive releases, breaking an unpinned run).
+          git clone https://github.com/NVIDIA/Isaac-GR00T.git /tmp/Isaac-GR00T
+          cd /tmp/Isaac-GR00T
+          git checkout d2b7e75b937e3ec9aa5dbc798f08b89692c49734
+          cd /tmp/Isaac-GR00T/scripts/lerobot_conversion
+          uv venv
+          source .venv/bin/activate
+          GIT_LFS_SKIP_SMUDGE=1 uv pip install -e . --verbose
+
+          # Download + convert in one step (the script snapshot-downloads the v3
+          # dataset, then converts to v2.1 and swaps the directories).
+          mkdir -p /data
+          # Security gate: {{ dataset_repo }} reaches shell contexts.
+          # Fail closed on anything outside [a-zA-Z0-9_/.-] before it renders.
+          # strict allowlist: [a-zA-Z0-9_/.-] only, 3-100 chars —
+          # the exact class security engineering specified. Parens, $, spaces,
+          # backticks, quotes all refuse here BEFORE any use of the value.
+          case "{{ dataset_repo }}" in
+            *[!a-zA-Z0-9_/.-]*) echo "dataset_repo failed allowlist: refused" >&2; exit 1 ;;
+            ???*) ;;   # 3+ chars, all in class: pass
+            *) echo "dataset_repo failed allowlist: refused" >&2; exit 1 ;;
+          esac
+
+          python convert_v3_to_v2.py \
+            --repo-id "{{ dataset_repo }}" \
+            --root /data \
+            --force-conversion
+
+          # The converted dataset now lives at /data/<repo-id> with the v3 original
+          # at /data/<repo-id>_v30. Attach the SO-100 dualcam modality.json
+          # (front + wrist cameras, single_arm 0:5 + gripper 5:6, human.task_description).
+          cp /tmp/Isaac-GR00T/examples/SO100/modality.json \
+             "/data/{{ dataset_repo }}/meta/modality.json"
+
+          # finish_sandwich videos are AV1 (verified from meta/info.json:
+          # observation.images.* -> info.video.codec == "av1"). Transcode every
+          # episode video to h264 yuv420p so GR00T's decord/eva-decord backend
+          # and the Cosmos conditioning step read them without AV1 issues.
+          # Same codec, same frame count, same resolution: metadata untouched.
+          python - <<'PY'
+          import pathlib, subprocess
+          root = pathlib.Path("/data/{{ dataset_repo }}")
+          for src in sorted(root.glob("videos/chunk-*/*/episode_*.mp4")):
+              dst = src.with_suffix(".h264.mp4")
+              subprocess.run([
+                  "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                  "-i", str(src),
+                  "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                  "-pix_fmt", "yuv420p", "-an", str(dst)], check=True)
+              src.unlink()
+              dst.rename(src)
+              print("transcoded to h264:", src)
+          PY
+
+          # Sanity gates before upload: fail the task loudly if any is missing.
+          python - <<'PY'
+          import json, pathlib
+          root = pathlib.Path("/data/{{ dataset_repo }}")
+          info = json.loads((root / "meta" / "info.json").read_text())
+          assert info["codebase_version"] == "v2.1", info["codebase_version"]
+          assert info["data_path"] == "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet", info["data_path"]
+          eps = (root / "meta" / "episodes.jsonl").read_text().strip().splitlines()
+          assert len(eps) == info["total_episodes"], (len(eps), info["total_episodes"])
+          assert (root / "meta" / "modality.json").exists()
+          cams = [k for k, v in info["features"].items() if v.get("dtype") == "video"]
+          assert set(cams) == {"observation.images.front", "observation.images.wrist"}, cams
+          n_parquet = len(list(root.glob("data/chunk-*/episode_*.parquet")))
+          assert n_parquet == info["total_episodes"], (n_parquet, info["total_episodes"])
+          n_videos = len(list(root.glob("videos/chunk-*/*/episode_*.mp4")))
+          assert n_videos == info["total_episodes"] * 2, n_videos
+          print("v2.1 dataset OK:", info["total_episodes"], "episodes,", len(cams), "cameras")
+          PY
+
+          # Self-managed upload: OSMO's upload sidecar truncated this 250-object
+          # tree (87 objects landed; "Data has been uploaded" masked it —
+          # the merge then failed on missing files). boto3 + the mounted
+          # s3-keys credential upload every object and COUNT them.
+          # The converter's uv venv is active here and has neither pip on PATH
+          # nor the pip module (uv venv ships neither) — `uv pip` is the
+          # only installer that targets this venv.
+          uv pip install --no-cache-dir boto3==1.43.113 >/dev/null
+          python - <<'PY'
+          import pathlib
+          import boto3
+
+          def read(name):
+              return pathlib.Path(f"/root/.s3keys/{name}").read_text().strip()
+
+          # Parse the storage_url override (s3://<bucket>/<prefix>) — nothing about
+          # this cluster (bucket, endpoint, tree prefix) is hardcoded.
+          _su = "{{ storage_url }}"
+          assert _su.startswith("s3://"), f"storage_url must be s3://<bucket>/<prefix>: {_su}"
+          _rest = _su[len("s3://"):]
+          BUCKET, _, TREE_ROOT = _rest.partition("/")
+          OVERRIDE = read("override_url")
+          s3 = boto3.client(
+              "s3",
+              endpoint_url=OVERRIDE,
+              aws_access_key_id=read("access_key_id"),
+              aws_secret_access_key=read("access_key"),
+              region_name=OVERRIDE.split("object.")[1].split(".")[0],
+          )
+          # {{ output_prefix }} (default `dataset`) keeps the boto3 upload and the
+          # sidecar's outputs marker in agreement (honored, not hardcoded).
+          # NOTE: NOT under the outputs URL ({output_prefix}/{workflow_id}/). OSMO's
+          # output sidecar mirror-syncs {{output}} to the outputs URL and DELETES
+          # any key under it that its scan didn't see - it raced this self-upload
+          # and truncated 246 objects to 88. The -data sibling
+          # prefix is invisible to the sidecar.
+          PREFIX = f"{TREE_ROOT}/{{ output_prefix }}-data/{{workflow_id}}/dataset/"
+          # Upload ONLY the converted tree: the converter leaves the v3 original at
+          # /data/<repo>_v30 as well. Keys keep the <org>/<repo>/ layout
+          # the later stages' TREE prefixes expect.
+          src = pathlib.Path("/data")
+          repo_dir = pathlib.Path("/data/{{ dataset_repo }}")
+          n = 0
+          for p in sorted(src.rglob("*")):
+              if not p.is_file() or ".cache" in p.parts:
+                  continue
+              if not p.is_relative_to(repo_dir):   # skip <repo>_v30 + siblings
+                  continue
+              key = PREFIX + str(p.relative_to(src))
+              s3.upload_file(str(p), BUCKET, key)
+              n += 1
+          print(f"self-upload: {n} objects to {BUCKET}/{PREFIX}")
+          # Gate derived from the uploaded tree itself (info.json is local at
+          # /data/<repo>/meta/info.json): 6 meta + parquet + 2 videos per episode.
+          import json as _json
+          _eps = _json.loads(repo_dir.joinpath("meta/info.json").read_text())["total_episodes"]
+          assert n >= 6 + 3 * _eps, (
+              f"stage-1 upload too small ({n} objects; want >= 6 meta + 3*{_eps}) — refusing to fake success")
+          # verify a download round-trip of one video head. Crusoe's list cache
+          # can go stale per-prefix : touch the prefix, then head.
+          head = None
+          for attempt in range(3):
+              try:
+                  head = s3.head_object(Bucket=BUCKET, Key=PREFIX + "{{ dataset_repo }}/meta/info.json")
+                  print("info.json size on bucket:", head["ContentLength"])
+                  break
+              except s3.exceptions.ClientError:
+                  s3.put_object(Bucket=BUCKET, Key=PREFIX + "{{ dataset_repo }}/.refresh",
+                                Body=b"head-cache-heal")
+          assert head is not None, "info.json head never succeeded after healing — the upload did not land"
+          PY
+
+          # Non-empty output marker so the sidecar's own upload step succeeds.
+          mkdir -p {{output}}/dataset
+          echo "dataset lives at {{ storage_url }}/{{ output_prefix }}-data/{{workflow_id}}/dataset/ (self-uploaded; the outputs url carries only this marker)" > {{output}}/dataset/LOCATION.txt
+          echo "stage-1 artifact done"
+        path: /tmp/entry.sh
+      outputs:
+      - url: {{ storage_url }}/{{ output_prefix }}/{{workflow_id}}/
+
+default-values:
+  pool: l40s
+  dataset_repo: izuluaga/finish_sandwich
+  storage_url: s3://osmo-bucket-placeholder/oso-data   # override with --set-string storage_url=s3://<bucket>/oso-data
+  output_prefix: dataset
